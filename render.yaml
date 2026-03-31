@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: finance-teen-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHANNEL_ID
+        sync: false
+      - key: ADMIN_TELEGRAM_ID
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: PEXELS_API_KEY
+        sync: false
+      - key: UPSTASH_REDIS_URL
+        sync: false
+      - key: UPSTASH_REDIS_TOKEN
+        sync: false
+      - key: RENDER_URL
+        sync: false
+      - key: BOT_TIMEZONE
+        value: Europe/Kyiv
+      - key: POST_HOUR
+        value: "10"
+      - key: POST_MINUTE
+        value: "0"
+      - key: PORT
+        value: "8080"
