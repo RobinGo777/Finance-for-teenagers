@@ -97,6 +97,16 @@ class RedisTracker:
         result = await self._command("GET", f"last_published:{weekday}")
         return result
 
+    async def get_last_daily_post_ymd(self) -> str | None:
+        """Остання календарна дата (YYYY-MM-DD), коли успішно вийшов щоденний пост."""
+        result = await self._command("GET", "last_daily_post_ymd")
+        return result if result else None
+
+    async def set_last_daily_post_ymd(self, ymd: str) -> None:
+        """Позначає що за цей календарний день щоденний пост уже вийшов."""
+        await self._command("SET", "last_daily_post_ymd", ymd)
+        await self._command("EXPIRE", "last_daily_post_ymd", 10 * 24 * 3600)
+
     async def ping(self) -> bool:
         """Перевіряє підключення до Redis."""
         try:
