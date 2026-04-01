@@ -3,11 +3,18 @@
 Модель: gemini-2.0-flash (швидка, безкоштовна квота)
 """
 
+import asyncio
 import json
 import logging
+import random
+
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Повтори при 429/5xx (безкоштовна квота Gemini часто дає rate limit)
+_GEMINI_MAX_RETRIES = 6
+_GEMINI_BASE_DELAY_S = 2.0
 
 GEMINI_API_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -188,13 +195,58 @@ class ContentGenerator:
             },
         }
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(url, json=payload)
+        for attempt in range(_GEMINI_MAX_RETRIES):
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                resp = await client.post(url, json=payload)
+
+            if resp.status_code == 429:
+                if attempt >= _GEMINI_MAX_RETRIES - 1:
+                    resp.raise_for_status()
+                delay = _gemini_retry_delay_s(resp, attempt)
+                logger.warning(
+                    "Gemini 429 (rate limit) — пауза %.1f с, спроба %d/%d",
+                    delay,
+                    attempt + 1,
+                    _GEMINI_MAX_RETRIES,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if 500 <= resp.status_code < 600:
+                if attempt >= _GEMINI_MAX_RETRIES - 1:
+                    resp.raise_for_status()
+                delay = min(45.0, _GEMINI_BASE_DELAY_S * (2**attempt))
+                logger.warning(
+                    "Gemini %s — пауза %.1f с, спроба %d/%d",
+                    resp.status_code,
+                    delay,
+                    attempt + 1,
+                    _GEMINI_MAX_RETRIES,
+                )
+                await asyncio.sleep(delay)
+                continue
+
             resp.raise_for_status()
             data = resp.json()
 
+            try:
+                return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            except (KeyError, IndexError) as e:
+                logger.error("Несподівана відповідь Gemini: %s", data)
+                raise RuntimeError(f"Gemini API: невалідна відповідь — {e}") from e
+
+        assert False, "unreachable"
+
+
+def _gemini_retry_delay_s(resp: httpx.Response, attempt: int) -> float:
+    """Затримка перед повтором: Retry-After від Google або експоненційний backoff + jitter."""
+    h = resp.headers.get("Retry-After")
+    if h:
         try:
-            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        except (KeyError, IndexError) as e:
-            logger.error(f"Несподівана відповідь Gemini: {data}")
-            raise RuntimeError(f"Gemini API: невалідна відповідь — {e}")
+            return min(120.0, float(h))
+        except ValueError:
+            pass
+    return min(
+        90.0,
+        _GEMINI_BASE_DELAY_S * (2**attempt) + random.uniform(0.5, 2.5),
+    )
