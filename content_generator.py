@@ -6,14 +6,15 @@
 import asyncio
 import json
 import logging
+import os
 import random
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-# Повтори при 429/5xx (безкоштовна квота Gemini часто дає rate limit)
-_GEMINI_MAX_RETRIES = 6
+# Повтори при 429/5xx — безкоштовна квота часто вимагає пауз 30–120+ с між спробами
+_GEMINI_MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "10"))
 _GEMINI_BASE_DELAY_S = 2.0
 
 GEMINI_API_URL = (
@@ -239,14 +240,16 @@ class ContentGenerator:
 
 
 def _gemini_retry_delay_s(resp: httpx.Response, attempt: int) -> float:
-    """Затримка перед повтором: Retry-After від Google або експоненційний backoff + jitter."""
+    """
+    Затримка перед повтором після 429.
+    Google інколи шле Retry-After; інакше — довгі паузи (короткі спроби всі падають підряд).
+    """
     h = resp.headers.get("Retry-After")
     if h:
         try:
-            return min(120.0, float(h))
+            return min(300.0, float(h))
         except ValueError:
             pass
-    return min(
-        90.0,
-        _GEMINI_BASE_DELAY_S * (2**attempt) + random.uniform(0.5, 2.5),
-    )
+    # 20 → 40 → 80 → … (cap 180 с) + jitter; дає час відновити RPM на free tier
+    base = 20.0 * (2**attempt)
+    return min(180.0, base + random.uniform(2.0, 12.0))
