@@ -14,6 +14,7 @@ import pytz
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import aiohttp
 from aiohttp import web
 
 from content_generator import ContentGenerator
@@ -40,10 +41,14 @@ TIMEZONE         = os.environ.get("BOT_TIMEZONE", "Europe/Kyiv")
 POST_HOUR        = int(os.environ.get("POST_HOUR", "10"))
 POST_MINUTE      = int(os.environ.get("POST_MINUTE", "0"))
 PORT             = int(os.environ.get("PORT", "8080"))
-RENDER_URL       = os.environ.get("RENDER_URL", "")
+_raw_render_url  = os.environ.get("RENDER_URL", "").strip().rstrip("/")
+RENDER_URL       = _raw_render_url if _raw_render_url else ""
 
 # ── Singleton Redis ───────────────────────────────────────────────────────────
 redis = RedisTracker(UPSTASH_URL, UPSTASH_TOKEN)
+
+# Щоб cron і catch-up не запускали два пости одночасно
+_daily_post_lock = asyncio.Lock()
 
 
 # ── Публікація в канал ────────────────────────────────────────────────────────
@@ -102,52 +107,86 @@ async def publish_to_channel(app: Application, post: dict) -> None:
             text=f"❌ <b>Помилка публікації!</b>\n<code>{e}</code>",
             parse_mode="HTML",
         )
+        raise
 
 
 # ── Щоденна задача ────────────────────────────────────────────────────────────
-async def daily_post_job(app: Application) -> None:
-    """Генерує та публікує пост. Redis гарантує що теми не повторюються."""
-    tz      = pytz.timezone(TIMEZONE)
-    weekday = datetime.now(tz).weekday()   # 0=Пн … 6=Нд
-    topic   = get_todays_topic(weekday)
+async def daily_post_job(app: Application, *, force: bool = False) -> None:
+    """
+    Генерує та публікує пост. Redis гарантує що теми не повторюються.
+    force=True — /post (завжди); інакше один раз на календарний день (cron і catch-up).
+    """
+    tz = pytz.timezone(TIMEZONE)
+    now = datetime.now(tz)
+    today_ymd = now.strftime("%Y-%m-%d")
 
-    topics_list = topic.get("topics", [])
+    async with _daily_post_lock:
+        if not force:
+            last = await redis.get_last_daily_post_ymd()
+            if last == today_ymd:
+                logger.info("⏭️ Сьогоднішній пост уже був — пропуск.")
+                return
 
-    # ── Обираємо тему через Redis (без повторів) ──────────────────────────────
-    if topics_list:
-        chosen_topic = await redis.get_unused_topic(weekday, topics_list)
-        topic["current_topic"] = chosen_topic
-    else:
-        chosen_topic = None   # дайджест — тема генерується динамічно
+        weekday = now.weekday()   # 0=Пн … 6=Нд
+        topic   = get_todays_topic(weekday)
 
-    logger.info(f"📅 {topic['label']} | {chosen_topic or 'дайджест'}")
+        topics_list = topic.get("topics", [])
 
-    generator = ContentGenerator(GEMINI_API_KEY)
-    media     = MediaFetcher(PEXELS_API_KEY)
+        # ── Обираємо тему через Redis (без повторів) ──────────────────────────────
+        if topics_list:
+            chosen_topic = await redis.get_unused_topic(weekday, topics_list)
+            topic["current_topic"] = chosen_topic
+        else:
+            chosen_topic = None   # дайджест — тема генерується динамічно
 
+        logger.info(f"📅 {topic['label']} | {chosen_topic or 'дайджест'}")
+
+        generator = ContentGenerator(GEMINI_API_KEY)
+        media     = MediaFetcher(PEXELS_API_KEY)
+
+        try:
+            post = await generator.generate(topic)
+
+            if not post.get("poll"):
+                photo_url = await media.fetch(topic["photo_query"])
+                post["photo_url"] = photo_url
+
+            post["topic_label"]   = topic["label"]
+            post["current_topic"] = chosen_topic or ""
+
+            await publish_to_channel(app, post)
+
+            # ── Позначаємо тему як використану в Redis ────────────────────────────
+            if chosen_topic:
+                await redis.mark_published(weekday, chosen_topic)
+
+            await redis.set_last_daily_post_ymd(today_ymd)
+
+        except Exception as e:
+            logger.error(f"❌ Помилка генерації: {e}")
+            await app.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"❌ <b>Помилка генерації!</b>\n<code>{e}</code>",
+                parse_mode="HTML",
+            )
+
+
+async def maybe_catch_up_missed_daily_post(app: Application) -> None:
+    """Після старту: якщо слот уже минув, а за сьогодні посту не було — публікуємо."""
     try:
-        post = await generator.generate(topic)
-
-        if not post.get("poll"):
-            photo_url = await media.fetch(topic["photo_query"])
-            post["photo_url"] = photo_url
-
-        post["topic_label"]   = topic["label"]
-        post["current_topic"] = chosen_topic or ""
-
-        await publish_to_channel(app, post)
-
-        # ── Позначаємо тему як використану в Redis ────────────────────────────
-        if chosen_topic:
-            await redis.mark_published(weekday, chosen_topic)
-
+        tz = pytz.timezone(TIMEZONE)
+        now = datetime.now(tz)
+        today_ymd = now.strftime("%Y-%m-%d")
+        if await redis.get_last_daily_post_ymd() == today_ymd:
+            return
+        slot = now.replace(hour=POST_HOUR, minute=POST_MINUTE, second=0, microsecond=0)
+        if now < slot:
+            logger.info("⏭️ Catch-up: до щоденного слота ще не настав час — чекаємо cron.")
+            return
+        logger.info("📌 Щоденний пост за сьогодні ще не виходив — доганяю після старту…")
+        await daily_post_job(app, force=False)
     except Exception as e:
-        logger.error(f"❌ Помилка генерації: {e}")
-        await app.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"❌ <b>Помилка генерації!</b>\n<code>{e}</code>",
-            parse_mode="HTML",
-        )
+        logger.error(f"❌ Catch-up: {e}")
 
 
 # ── Admin-команди ─────────────────────────────────────────────────────────────
@@ -176,7 +215,7 @@ async def cmd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ADMIN_ID:
         return
     await update.message.reply_text("⏳ Генерую пост…")
-    await daily_post_job(ctx.application)
+    await daily_post_job(ctx.application, force=True)
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -281,11 +320,10 @@ async def start_web_server():
     logger.info(f"🌐 HTTP сервер на порті {PORT}")
 
 
-async def keep_alive_job():
-    """Пінгує сам себе кожні 5 хв — Render не засипає."""
+async def keep_alive_ping_once() -> None:
+    """Один HTTP GET на публічний /health (Render бачить вхідний трафік)."""
     if not RENDER_URL:
         return
-    import aiohttp
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -297,8 +335,18 @@ async def keep_alive_job():
         logger.warning(f"Keep-alive failed: {e}")
 
 
+async def keep_alive_loop() -> None:
+    """Фоновий цикл кожні 5 хв — надійніше, ніж APScheduler interval (там перший запуск часто зсувається)."""
+    if not RENDER_URL:
+        return
+    while True:
+        await keep_alive_ping_once()
+        await asyncio.sleep(300)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
+    keep_alive_task: asyncio.Task | None = None
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start",  cmd_start))
@@ -318,20 +366,25 @@ async def main():
         args=[app],
         id="daily_post",
     )
-    scheduler.add_job(
-        keep_alive_job,
-        trigger="interval",
-        minutes=5,
-        id="keep_alive",
-    )
     scheduler.start()
 
     await start_web_server()
+
+    if RENDER_URL:
+        keep_alive_task = asyncio.create_task(keep_alive_loop())
+        logger.info("Keep-alive: фоновий цикл кожні 5 хв (self-ping на RENDER_URL/health)")
+    else:
+        logger.warning(
+            "RENDER_URL не задано — self-ping вимкнено. "
+            "Додай у Render Environment: RENDER_URL=https://<твій-сервіс>.onrender.com"
+        )
+
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
     logger.info(f"🤖 Бот запущено! Публікація о {POST_HOUR:02d}:{POST_MINUTE:02d} ({TIMEZONE})")
+    asyncio.create_task(maybe_catch_up_missed_daily_post(app))
 
     try:
         while True:
@@ -339,6 +392,12 @@ async def main():
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
+        if keep_alive_task:
+            keep_alive_task.cancel()
+            try:
+                await keep_alive_task
+            except asyncio.CancelledError:
+                pass
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
