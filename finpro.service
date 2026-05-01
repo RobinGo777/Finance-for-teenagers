@@ -1,0 +1,15 @@
+[Unit]
+Description=ФінПро Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/finpro_bot
+EnvironmentFile=/home/ubuntu/finpro_bot/.env
+ExecStart=/home/ubuntu/finpro_bot/venv/bin/python main.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
