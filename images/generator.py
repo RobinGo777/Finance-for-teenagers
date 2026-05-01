@@ -1,7 +1,15 @@
 import io
+import logging
+import re
 import textwrap
+import httpx
 from PIL import Image, ImageDraw, ImageFont
-from config import VISUAL_TEMPLATES
+from config import (
+    VISUAL_TEMPLATES,
+    PEXELS_API_KEY,
+    UNSPLASH_ACCESS_KEY,
+    STOCK_PHOTO_PROVIDER,
+)
 
 
 # ─────────────────────────────────────────
@@ -12,6 +20,7 @@ IMG_WIDTH  = 1280
 IMG_HEIGHT = 720
 FONT_PATH  = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 FONT_PATH_REGULAR = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+logger = logging.getLogger(__name__)
 
 
 def _hex_to_rgb(hex_color: str) -> tuple:
@@ -24,6 +33,144 @@ def _load_font(path: str, size: int) -> ImageFont.FreeTypeFont:
         return ImageFont.truetype(path, size)
     except OSError:
         return ImageFont.load_default()
+
+
+def _normalize_query(text: str) -> str:
+    clean = re.sub(r"[^\w\s-]", " ", text, flags=re.UNICODE)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean[:80]
+
+
+def _photo_queries(title: str, body: str, rubric: str) -> list[str]:
+    queries = []
+    base = f"{title} {rubric}".strip()
+    if base:
+        queries.append(_normalize_query(base))
+    if body:
+        queries.append(_normalize_query(body))
+    queries.extend(
+        [
+            "finance business technology",
+            "money investment economics",
+            "startup office data chart",
+        ]
+    )
+    return [q for q in queries if q]
+
+
+def _fetch_pexels_url(client: httpx.Client, query: str) -> str | None:
+    if not PEXELS_API_KEY:
+        return None
+    try:
+        resp = client.get(
+            "https://api.pexels.com/v1/search",
+            headers={"Authorization": PEXELS_API_KEY},
+            params={"query": query, "per_page": 1, "orientation": "landscape"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        photos = data.get("photos", [])
+        if not photos:
+            return None
+        src = photos[0].get("src", {})
+        return src.get("large2x") or src.get("large") or src.get("original")
+    except Exception as exc:
+        logger.warning("Pexels search failed: %s", exc)
+        return None
+
+
+def _fetch_unsplash_url(client: httpx.Client, query: str) -> str | None:
+    if not UNSPLASH_ACCESS_KEY:
+        return None
+    try:
+        resp = client.get(
+            "https://api.unsplash.com/search/photos",
+            params={
+                "query": query,
+                "page": 1,
+                "per_page": 1,
+                "orientation": "landscape",
+                "client_id": UNSPLASH_ACCESS_KEY,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results", [])
+        if not results:
+            return None
+        urls = results[0].get("urls", {})
+        return urls.get("regular") or urls.get("full")
+    except Exception as exc:
+        logger.warning("Unsplash search failed: %s", exc)
+        return None
+
+
+def _build_stock_photo(
+    title: str,
+    body: str,
+    rubric: str,
+    persona_name: str,
+    template: dict,
+) -> bytes | None:
+    providers: list[str]
+    if STOCK_PHOTO_PROVIDER == "pexels":
+        providers = ["pexels"]
+    elif STOCK_PHOTO_PROVIDER == "unsplash":
+        providers = ["unsplash"]
+    else:
+        providers = ["pexels", "unsplash"]
+
+    queries = _photo_queries(title, body, rubric)
+    if not queries:
+        return None
+
+    try:
+        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+            photo_url = None
+            for query in queries:
+                for provider in providers:
+                    if provider == "pexels":
+                        photo_url = _fetch_pexels_url(client, query)
+                    else:
+                        photo_url = _fetch_unsplash_url(client, query)
+                    if photo_url:
+                        break
+                if photo_url:
+                    break
+
+            if not photo_url:
+                return None
+
+            image_resp = client.get(photo_url)
+            image_resp.raise_for_status()
+
+            img = Image.open(io.BytesIO(image_resp.content)).convert("RGB")
+            img = img.resize((IMG_WIDTH, IMG_HEIGHT), Image.Resampling.LANCZOS)
+
+            draw = ImageDraw.Draw(img)
+            accent_color = _hex_to_rgb(template["accent"])
+            white = (255, 255, 255)
+
+            # Overlay for readability on bright photos.
+            overlay_top = Image.new("RGBA", (IMG_WIDTH, IMG_HEIGHT), (0, 0, 0, 0))
+            overlay_draw = ImageDraw.Draw(overlay_top)
+            overlay_draw.rectangle([(0, IMG_HEIGHT - 220), (IMG_WIDTH, IMG_HEIGHT)], fill=(0, 0, 0, 130))
+            img = Image.alpha_composite(img.convert("RGBA"), overlay_top).convert("RGB")
+            draw = ImageDraw.Draw(img)
+
+            font_rubric = _load_font(FONT_PATH, 28)
+            font_title = _load_font(FONT_PATH, 58)
+            font_persona = _load_font(FONT_PATH_REGULAR, 24)
+
+            draw.rectangle([(0, 0), (8, IMG_HEIGHT)], fill=accent_color)
+            draw.text((48, 42), rubric.upper(), font=font_rubric, fill=accent_color)
+            draw.text((48, IMG_HEIGHT - 190), textwrap.fill(title, width=34), font=font_title, fill=white)
+            draw.text((48, IMG_HEIGHT - 52), f"автор: {persona_name}", font=font_persona, fill=accent_color)
+
+            return _save_image(img)
+    except Exception as exc:
+        logger.warning("Stock photo pipeline failed: %s", exc)
+        return None
 
 
 # ─────────────────────────────────────────
@@ -41,6 +188,16 @@ def generate_post_image(
     Генерує картинку для поста через Pillow.
     Повертає PNG у вигляді bytes.
     """
+    stock_photo = _build_stock_photo(
+        title=title,
+        body=body,
+        rubric=rubric,
+        persona_name=persona_name,
+        template=template,
+    )
+    if stock_photo:
+        return stock_photo
+
     bg_color     = _hex_to_rgb(template["bg"])
     accent_color = _hex_to_rgb(template["accent"])
     white        = (255, 255, 255)
