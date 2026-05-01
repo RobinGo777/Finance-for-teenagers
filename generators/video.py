@@ -1,7 +1,14 @@
+import re
+
 from generators.gemini import generate_json, pick_persona, build_base_prompt
 from data.redis_client import get_used_topics, save_topic, is_published, mark_published
-from data.fetchers import fetch_youtube_videos
-from config import VISUAL_TEMPLATES
+from data.fetchers import fetch_youtube_videos, fetch_news
+from config import (
+    VISUAL_TEMPLATES,
+    TRUSTED_VIDEO_CHANNEL_HINTS,
+    VIDEO_CLICKBAIT_TERMS,
+    VIDEO_MATCH_STOPWORDS,
+)
 
 RUBRIC_KEY     = "video"
 RUBRIC_NAME    = "#ВідеоТижня"
@@ -19,6 +26,38 @@ SEARCH_QUERIES = [
     "NASA space exploration 2026",
 ]
 
+MATCH_STOPWORDS = set(VIDEO_MATCH_STOPWORDS)
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _tokenize(text: str) -> set[str]:
+    tokens = re.findall(r"[a-zA-Zа-яА-ЯіїєґІЇЄҐ0-9]+", _normalize_text(text))
+    return {t for t in tokens if len(t) > 2 and t not in MATCH_STOPWORDS}
+
+
+def _has_clickbait(title: str) -> bool:
+    t = _normalize_text(title)
+    return any(term in t for term in VIDEO_CLICKBAIT_TERMS)
+
+
+def _is_trusted_channel(channel: str) -> bool:
+    c = _normalize_text(channel)
+    return any(hint in c for hint in TRUSTED_VIDEO_CHANNEL_HINTS)
+
+
+def _matches_recent_news(video_title: str, recent_news_titles: list[str]) -> bool:
+    video_tokens = _tokenize(video_title)
+    if not video_tokens:
+        return False
+    for news_title in recent_news_titles:
+        overlap = video_tokens.intersection(_tokenize(news_title))
+        if len(overlap) >= 2:
+            return True
+    return False
+
 
 async def generate_video() -> dict | None:
     """
@@ -32,6 +71,13 @@ async def generate_video() -> dict | None:
 
     # Organic Growth шаблон для відео
     template = next((t for t in VISUAL_TEMPLATES if t["name"] == "Organic Growth"), None)
+
+    recent_news = await fetch_news(
+        query="technology OR AI OR robotics OR science",
+        language="en",
+        page_size=20,
+    )
+    recent_news_titles = [item.get("title", "") for item in recent_news if item.get("title")]
 
     # Шукаємо відео по всіх запитах
     all_videos = []
@@ -49,17 +95,33 @@ async def generate_video() -> dict | None:
     if not all_videos:
         return None
 
+    # Відсікаємо клікбейт і нерелевантне до свіжих новин
+    quality_videos = []
+    for v in all_videos:
+        if _has_clickbait(v.get("title", "")):
+            continue
+        if recent_news_titles and not _matches_recent_news(v.get("title", ""), recent_news_titles):
+            continue
+        quality_videos.append(v)
+
+    if not quality_videos:
+        return None
+
     # Фільтруємо вже опубліковані
     new_videos = []
-    for v in all_videos:
+    for v in quality_videos:
         if not await is_published(v["video_id"]):
             new_videos.append(v)
 
     if not new_videos:
         return None
 
-    # Топ 5 по переглядах для промпту
-    top_videos = sorted(new_videos, key=lambda x: x["views"], reverse=True)[:5]
+    # Пріоритезуємо надійні канали, потім перегляди
+    top_videos = sorted(
+        new_videos,
+        key=lambda x: (_is_trusted_channel(x.get("channel", "")), x["views"]),
+        reverse=True,
+    )[:5]
 
     videos_str = "\n".join(
         f"- ID: {v['video_id']} | {v['title']} | {v['channel']} | {v['views']:,} переглядів"
